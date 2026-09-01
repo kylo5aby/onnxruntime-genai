@@ -45,6 +45,7 @@ from .qwen import (
 )
 from .smollm import SmolLM3Model
 from .whisper import WhisperModel
+from .zimage import ZImageTransformerModel
 
 __all__ = [
     "ChatGLMModel",
@@ -86,4 +87,5 @@ __all__ = [
     "SmolLM3Model",
     "VideoChatFlashQwenModel",
     "WhisperModel",
+    "ZImageTransformerModel",
 ]

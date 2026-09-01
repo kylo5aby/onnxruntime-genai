@@ -11,8 +11,10 @@ Run the model builder to create the desired ONNX model.
 """
 
 import argparse
+import json
 import os
 import textwrap
+import types
 from typing import Any
 
 import onnx_ir as ir
@@ -50,6 +52,7 @@ from builders import (
     SmolLM3Model,
     VideoChatFlashQwenModel,
     WhisperModel,
+    ZImageTransformerModel,
 )
 from builders.qwen import Qwen35Model, Qwen35MoEModel
 from quantization import KV_CACHE_QUANT_SCHEMES, QuantConfig
@@ -99,6 +102,19 @@ def get_hf_details(model_name, input_path, cache_dir, extra_options):
     hf_name = input_path if os.path.isdir(input_path) else model_name
     hf_token = extra_options.get("hf_token", True)
     hf_remote = extra_options.get("hf_remote", False)
+
+    config_path = os.path.join(input_path, "config.json") if os.path.isdir(input_path) else None
+    if config_path and os.path.isfile(config_path):
+        with open(config_path) as f:
+            raw_config = json.load(f)
+        if "_class_name" in raw_config and "architectures" not in raw_config:
+            # Diffusers-style config (e.g. Z-Image-Turbo's `transformer/config.json`): not
+            # `transformers`-AutoConfig loadable, and there is no tokenizer to load for it.
+            # `AutoConfig.from_pretrained` normally stamps `_name_or_path` onto the config;
+            # do the same here since `Model.__init__` relies on it for weight loading.
+            raw_config.setdefault("_name_or_path", hf_name)
+            config = types.SimpleNamespace(**raw_config)
+            return {"extra_kwargs": extra_kwargs, "hf_name": hf_name, "hf_config": config}
 
     config = AutoConfig.from_pretrained(hf_name, token=hf_token, trust_remote_code=hf_remote, **extra_kwargs)
     tokenizer = AutoTokenizer.from_pretrained(hf_name, token=hf_token, trust_remote_code=hf_remote, **extra_kwargs)
@@ -478,7 +494,9 @@ def create_model(
     config_only = extra_options.get("config_only", False)
 
     # List architecture options in alphabetical order
-    if config.architectures[0] == "ChatGLMForConditionalGeneration" or config.architectures[0] == "ChatGLMModel":
+    if getattr(config, "_class_name", None) == "ZImageTransformer2DModel":
+        onnx_model = ZImageTransformerModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
+    elif config.architectures[0] == "ChatGLMForConditionalGeneration" or config.architectures[0] == "ChatGLMModel":
         # Quantized ChatGLM model has ChatGLMForConditionalGeneration as architecture whereas HF model as the latter
         config.bos_token_id = 1
         config.hidden_act = "swiglu"
