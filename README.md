@@ -1,204 +1,150 @@
-# ONNX Runtime GenAI
+# Z-Image-Turbo Transformer Trunk Exporter (onnxruntime-genai dev branch)
 
-## Status
+This branch of `onnxruntime-genai` adds a standalone ONNX exporter for the diffusion
+transformer trunk of [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo)
+(diffusers class `ZImageTransformer2DModel`). It is not an onnxruntime-genai runtime
+integration — the exported graph consumes pre-computed caption embeddings and a raw image
+latent, and produces a denoised/velocity-predicted latent, run directly via a plain
+`onnxruntime.InferenceSession`. A caller drives the diffusion sampling loop, text encoding,
+and VAE decode itself.
 
-[![Latest version](https://img.shields.io/nuget/vpre/Microsoft.ML.OnnxRuntimeGenAI.Managed?label=latest)](https://www.nuget.org/packages/Microsoft.ML.OnnxRuntimeGenAI.Managed/absoluteLatest)
+All of the exporter code lives under `src/python/py/models/`:
 
-[![Nightly Build](https://github.com/microsoft/onnxruntime-genai/actions/workflows/linux-cpu-x64-nightly-build.yml/badge.svg)](https://github.com/microsoft/onnxruntime-genai/actions/workflows/linux-cpu-x64-nightly-build.yml)
+| File | Contents |
+|---|---|
+| [`src/python/py/models/builders/zimage.py`](src/python/py/models/builders/zimage.py) | `ZImageTransformerModel`, the exporter itself |
+| [`src/python/py/models/build_z_image_turbo.py`](src/python/py/models/build_z_image_turbo.py) | CLI wrapper for building all precision variants |
+| [`src/python/py/models/run_z_image_turbo.py`](src/python/py/models/run_z_image_turbo.py) | Standalone end-to-end text-to-image pipeline driver that can run the exported transformer |
+| [`src/python/py/models/builders/ZIMAGE_DESIGN.md`](src/python/py/models/builders/ZIMAGE_DESIGN.md) | Architecture, scope, and design rationale |
+| [`src/python/py/models/builders/ZIMAGE_USAGE.md`](src/python/py/models/builders/ZIMAGE_USAGE.md) | Full build/run/verify walkthrough, using `builder.py` directly |
+| [`src/python/py/models/DESIGN.md`](src/python/py/models/DESIGN.md) | Design of the general model-builder pipeline this exporter reuses pieces of |
 
-## Description
+## Scope
 
-Run generative AI models with ONNX Runtime. This API gives you an easy, flexible and performant way of running LLMs on device. It implements the generative AI loop for ONNX models, including pre and post processing, inference with ONNX Runtime, logits processing, search and sampling, KV cache management, and grammar specification for tool calling.
+- **Transformer trunk only.** No Qwen3 text encoder, no VAE decoder.
+- **Standalone ONNX graph.** No onnxruntime-genai C++ generator runtime integration.
+- **Dynamic height/width**, batch size fixed at 1.
+- **No padding/pad-token machinery** — resolutions and caption lengths must already satisfy
+  the precondition below.
 
-ONNX Runtime GenAI powers Foundry Local, Windows ML, and the Visual Studio Code AI Toolkit.
+See [ZIMAGE_DESIGN.md#scope](src/python/py/models/builders/ZIMAGE_DESIGN.md#scope) for the
+full list of what's out of scope (SigLIP/Omni conditioning, LoRA, ControlNet, multiple patch
+sizes, gradient checkpointing).
 
-See documentation at the [ONNX Runtime website](https://onnxruntime.ai/docs/genai) for more details.
-
-| Support matrix | Supported now | Under development | On the roadmap|
-| -------------- | ------------- | ----------------- | -------------- |
-| Model architectures | AMD OLMo <br/> ChatGLM <br/> DeepSeek <br/> ERNIE 4.5 <br/> Fara <br/> Gemma <br/> gpt-oss <br/> Granite <br/> Granite MoE Hybrid <br/> HunYuan Dense V1 <br/> InternLM2 <br/> Llama <br/> Mistral <br/> Nemotron <br/> Phi (language + vision) <br/> Qwen (language + vision) <br/> SmolLM3 <br/> Whisper | Stable diffusion | Multi-modal models |
-| API | Python <br/>C# <br/>C/C++ <br/> Java ^ | Objective-C ||
-| O/S | Linux <br/> Windows <br/>Mac  <br/>Android || iOS |||
-| Architecture | x86 <br/> x64 <br/> arm64 ||||
-| Hardware Acceleration | CPU <br/> CUDA <br/> DirectML <br/> NvTensorRtRtx (TRT-RTX) <br/> OpenVINO <br/> QNN <br/> WebGPU | | AMD GPU |
-| Features | Multi-LoRA <br/> Continuous decoding <br/> Constrained decoding | | Speculative decoding |
-
-^ Requires build from source
-
-## Installation
-
-See [installation instructions](https://onnxruntime.ai/docs/genai/howto/install) or [build from source](https://onnxruntime.ai/docs/genai/howto/build-from-source.html)
-
-## Sample code for Phi-3 in Python
-
-1. Download the model
-
-   ```shell
-   huggingface-cli download microsoft/Phi-3-mini-4k-instruct-onnx --include cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4/* --local-dir .
-   ```
-
-2. Install the API
-
-   ```shell
-   pip install numpy
-   pip install --pre onnxruntime-genai
-   ```
-
-3. Run the model
-
-   ```python
-   import onnxruntime_genai as og
-
-   model = og.Model('cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4')
-   tokenizer = og.Tokenizer(model)
-   stream = tokenizer.create_stream()
-    
-   # Set the max length to something sensible by default,
-   # since otherwise it will be set to the entire context length
-   search_options = {}
-   search_options['max_length'] = 2048
-   search_options['batch_size'] = 1
-
-   chat_template = '<|user|>\n{input} <|end|>\n<|assistant|>'
-
-   text = input("Input: ")
-   if not text:
-      print("Error, input cannot be empty")
-      exit()
-
-   prompt = f'{chat_template.format(input=text)}'
-
-   input_tokens = tokenizer.encode(prompt)
-
-   params = og.GeneratorParams(model)
-   params.set_search_options(**search_options)
-   generator = og.Generator(model, params)
-  
-   print("Output: ", end='', flush=True)
-
-   try:
-      generator.append_tokens(input_tokens)
-      while not generator.is_done():
-         generator.generate_next_token()
-         new_token = generator.get_next_tokens()[0]
-         print(stream.decode(new_token), end='', flush=True)
-   except KeyboardInterrupt:
-         print("  --control+c pressed, aborting generation--")
-
-   print()
-   del generator
-   ```
-
-### Choose the correct version of the examples
-
-Due to the evolving nature of this project and ongoing feature additions, examples in the `main` branch may not always align with the latest stable release. This section outlines how to ensure compatibility between the examples and the corresponding version.
-
-### Stable version
-
-Install the package according to the [installation instructions](https://onnxruntime.ai/docs/genai/howto/install). For example, install the Python package.
+## Quick Start: Building the Model
 
 ```bash
-pip install onnxruntime-genai
+cd src/python/py/models
+pip install diffusers pillow  # in addition to this repo's normal torch/onnx_ir/transformers/onnxruntime deps
 ```
 
-Get the version of the package
+Download the checkpoint:
 
-Linux/Mac:
-```bash
-pip list | grep onnxruntime-genai
+```py
+from huggingface_hub import snapshot_download
+snapshot_download("Tongyi-MAI/Z-Image-Turbo", local_dir="path_to_local_folder")
 ```
 
-Windows:
-```bash
-pip list | findstr "onnxruntime-genai"
-```
-
-Then, check out the version of the examples that corresponds to that release.
+Build with [`build_z_image_turbo.py`](src/python/py/models/build_z_image_turbo.py), which
+wraps `builder.py` with the WebGPU EP and the extra options this model needs pre-filled in.
+Pick one of four precisions with `-p`:
 
 ```bash
-# Clone the repo
-git clone https://github.com/microsoft/onnxruntime-genai.git && cd onnxruntime-genai
-# Checkout the branch for the version you are using
-git checkout v0.11.5
-cd examples
+python build_z_image_turbo.py path_to_local_folder -p <precision>
 ```
 
-### Nightly version (main branch)
+| `-p` value | `builder.py -p` | I/O dtype | Weights | Notes |
+|---|---|---|---|---|
+| `f16` | `fp16` | float16 | unquantized | |
+| `f32` | `fp32` | float32 | unquantized | |
+| `f16_int4_quant` (default) | `int4` | float16 | int4 (`MatMulNBits`) | `block_size=32 accuracy_level=4` |
+| `f32_int4_quant` | `int4` | float32 | int4 (`MatMulNBits`) | same as above + `use_webgpu_fp32=true` |
 
-Checkout the main branch of the repo
+Output goes to `<model_name>-transformer-genai-wgpu-<precision>/`. All four variants are
+verified to produce correct (non-NaN) output — see
+[ZIMAGE_DESIGN.md#float16-dynamic-range-overflow](src/python/py/models/builders/ZIMAGE_DESIGN.md#float16-dynamic-range-overflow)
+for the float16 NaN issue this required fixing.
+
+For finer control (different EP, `int8`, custom `--extra_options`, etc.), call `builder.py`
+directly — see
+[ZIMAGE_USAGE.md#building-the-onnx-model](src/python/py/models/builders/ZIMAGE_USAGE.md#building-the-onnx-model).
+
+## Precondition on Resolution and Caption Length
+
+Because the exported graph has no padding/masking logic, the caller must ensure:
+
+- `(height / patch_size) * (width / patch_size) % 32 == 0` (`patch_size = 2`) — holds for
+  every standard resolution divisible by 16 (512, 768, 1024, ...), including non-square
+  combinations.
+- The caption embedding's sequence length is already a multiple of 32 tokens.
+
+Violating either precondition does not error at export time — it silently computes the
+wrong thing at inference time. See
+[ZIMAGE_USAGE.md#precondition-on-resolution-and-caption-length](src/python/py/models/builders/ZIMAGE_USAGE.md#precondition-on-resolution-and-caption-length).
+
+## Running the Exported Graph
+
+```py
+import onnxruntime as ort
+
+sess = ort.InferenceSession("path_to_output_folder/model.onnx", providers=["CPUExecutionProvider"])
+sample = sess.run(
+    ["sample"],
+    {
+        "hidden_states": hidden_states_np,          # [1, 16, H, W]
+        "encoder_hidden_states": encoder_hidden_states_np,  # [1, cap_len, 2560]
+        "timestep": timestep_np,                    # [1]
+    },
+)[0]
+```
+
+Full details, including a verification script that cross-checks the ONNX output against a
+hand-written PyTorch reference, are in
+[ZIMAGE_USAGE.md#running-the-exported-graph](src/python/py/models/builders/ZIMAGE_USAGE.md#running-the-exported-graph)
+and
+[ZIMAGE_USAGE.md#verifying-numerical-correctness](src/python/py/models/builders/ZIMAGE_USAGE.md#verifying-numerical-correctness).
+
+## Running the Full Pipeline (Text-to-Image)
+
+[`run_z_image_turbo.py`](src/python/py/models/run_z_image_turbo.py) is a standalone,
+self-contained script that drives an actual end-to-end Z-Image-Turbo text-to-image
+generation (tokenizer -> text encoder -> flow-matching denoising loop -> VAE decode -> PNG),
+useful for exercising the exported transformer against real prompts instead of the synthetic
+tensors used for verification.
+
+It expects a WebNN-exported Z-Image-Turbo model directory (with `tokenizer/`,
+`onnx/text_encoder_model_q4f16.onnx`, and `onnx/vae_decoder_model_f16.onnx`) for the
+tokenizer/text-encoder/VAE — this script does not export those; only the transformer is
+in scope for this repo. Pass `--transformer` to swap in the transformer exported by
+`build_z_image_turbo.py` above in place of that bundle's own transformer:
 
 ```bash
-git clone https://github.com/microsoft/onnxruntime-genai.git && cd onnxruntime-genai
+cd src/python/py/models
+pip install psutil transformers pillow torch onnxruntime  # in addition to the deps above
+
+python run_z_image_turbo.py path_to_webnn_z_image_turbo_dir \
+  --transformer path_to_output_folder/model.onnx \
+  --prompt "a cat under the snow with blue eyes, cinematic style" \
+  --height 512 --width 512 \
+  -n 4 -o output.png
 ```
 
-Build from source, using these [instructions](https://onnxruntime.ai/docs/genai/howto/build-from-source.html). For example, to build the Python wheel:
+`--transformer` accounts for this dev exporter's differences from the bundled WebNN
+transformer automatically: 4D `hidden_states` (no `num_frames` axis), no attention
+mask/padding (`encoder_hidden_states` is padded to a multiple of 32 tokens by repeating the
+last real token's embedding), and whichever I/O dtype (`float16`/`float32`) the chosen `-p`
+build used. Text encoder and VAE decoder are always the WebNN bundle's own models,
+regardless of `--transformer`. Run without `--transformer` to use the WebNN bundle
+end-to-end as a baseline for comparison. See `--help` for `--ep` (WebGPU/CPU),
+`--all_images` (dump every denoising step), `-l/--loop` (repeat generation), and `-v`
+(verbose per-tensor stats) options.
 
-```bash
-python build.py
-```
+## Further Reading
 
-Navigate to the examples folder in the main branch.
-
-```bash
-cd examples
-```
-
-To install the nightly Python build:
-
-```bash
-# Change onnxruntime-genai to the Python package you want to install
-pip install --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ORT-Nightly/pypi/simple/ onnxruntime-genai
-```
-
-## Roadmap
-
-See the [Discussions](https://github.com/microsoft/onnxruntime-genai/discussions) to request new features and up-vote existing requests.
-
-
-## Data/Telemetry
-
-This project may collect usage data and send it to Microsoft to help improve our products and services. See the [privacy statement](docs/Privacy.md) for details.
-
-## Contributing
-
-This project welcomes contributions and suggestions.  Most contributions require you to agree to a
-Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us
-the rights to use your contribution. For details, visit https://cla.opensource.microsoft.com.
-
-See [DEVELOPMENT.md](docs/DEVELOPMENT.md) for how to build, test, and lint the library from source.
-
-When you submit a pull request, a CLA bot will automatically determine whether you need to provide
-a CLA and decorate the PR appropriately (e.g., status check, comment). Simply follow the instructions
-provided by the bot. You will only need to do this once across all repos using our CLA.
-
-This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
-For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or
-contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
-
-### Linting
-
-This project enables [lintrunner](https://github.com/suo/lintrunner) for linting. You can install the dependencies and initialize with
-
-```sh
-pip install -r requirements-lintrunner.txt
-lintrunner init
-```
-
-This will install lintrunner on your system and download all the necessary dependencies to run linters locally.
-
-To format local changes:
-
-```bash
-lintrunner -a
-```
-
-To format all files:
-
-```bash
-lintrunner -a --all-files
-```
-
-## Trademarks
-
-This project may contain trademarks or logos for projects, products, or services. Authorized use of Microsoft 
-trademarks or logos is subject to and must follow [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general). Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship. Any use of third-party trademarks or logos are subject to those third-party's policies.
+- [ZIMAGE_DESIGN.md](src/python/py/models/builders/ZIMAGE_DESIGN.md) — why this doesn't fit
+  the standard `Model` pipeline, RoPE/patchify/AdaLN graph construction, quantization
+  coverage, the float16 overflow fix, and a symbolic-dim-aliasing implementation gotcha.
+- [ZIMAGE_USAGE.md](src/python/py/models/builders/ZIMAGE_USAGE.md) — build/run/verify
+  walkthrough and troubleshooting.
+- [DESIGN.md](src/python/py/models/DESIGN.md) — the general model-builder pipeline
+  (`Model`, `make_matmul`, quantization pass) this exporter reuses low-level pieces of.
