@@ -160,10 +160,35 @@ past/present KV inputs.
 
 Every `Linear` goes through the inherited `make_matmul`, so `-p int4`/`int8` apply
 automatically via the same mechanism every other model in this builder uses (a generic,
-op-type-driven pass at save time — see `DESIGN.md`). `t_embedder`, `cap_embedder`, and every
+op-type-driven pass at save time — see `DESIGN.md`). `t_embedder` and every
 `adaLN_modulation` Linear are marked `exclude_from_quantization` (via `_linear`'s
-`exclude_from_quant=True`) since they're small, precision-sensitive layers — diffusers
-itself marks `t_embedder`/`cap_embedder` as `_skip_layerwise_casting_patterns`.
+`exclude_from_quant=True`) since they're small, precision-sensitive conditioning layers —
+diffusers itself marks `t_embedder`/`cap_embedder` as `_skip_layerwise_casting_patterns`,
+though `cap_embedder`'s own Linear is *not* currently marked `exclude_from_quant` here and
+so is quantized like any other weight (unlike `t_embedder`, which is).
+
+For `f16_int4_quant`, this leaves exactly 35 `MatMul` nodes unquantized (never converted to
+`MatMulNBits`): `t_embedder/mlp0` + `t_embedder/mlp2` (2), `adaLN_modulation/Linear` in
+every modulated block -- 2 `noise_refiner` + 30 `layers` (32) -- and `final_adaLN/Linear0`
+(1). Every other `Linear`, including `cap_embedder_linear`, becomes `MatMulNBits`.
+
+`op_types_to_quantize=MatMul/Gather` (see `build_z_image_turbo.py`) also makes `Gather`
+nodes whose data operand is a constant weight initializer eligible for
+`GatherBlockQuantized`. The *only* `Gather`s in this graph with a constant initializer as
+their data input are the 3 precomputed RoPE frequency tables from `_make_rope_tables`
+(each gathered once for image positions, once for caption positions -- 6 `Gather` nodes
+total), so those are exactly what get converted; none were explicitly targeted for this,
+"Gather" quantization here is really an LLM-embedding-table convention that happens to also
+catch these tables. This is arguably unintended: the tables are real-valued cos/sin
+rotation values (not a large embedding matrix, so there's no meaningful size win), and
+`GatherBlockQuantized`'s int4 rounding directly degrades every RoPE-rotated Q/K value.
+Every other `Gather` in the graph (RoPE real/imag pair extraction, `height`/`width`/
+`cap_seq_len` shape extraction, cos/sin splitting from `freqs_cis` -- 143 nodes total) reads
+from a runtime-computed tensor, not a weight, so none of them were ever quantization
+candidates in the first place. If this turns out to visibly hurt accuracy, the fix is to
+mark the 3 RoPE tables `exclude_from_quant`-equivalent (add their `Gather` node names to
+`nodes_to_exclude`, or drop `Gather` from `op_types_to_quantize` and rely on `MatMul`
+quantization alone -- this model has no real embedding table to lose by doing so).
 
 ## float16 Dynamic-Range Overflow
 

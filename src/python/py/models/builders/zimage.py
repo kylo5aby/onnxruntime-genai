@@ -477,7 +477,14 @@ class ZImageTransformerModel(Model):
     # Attention / FeedForward / transformer block
     # ------------------------------------------------------------------
     def _rescale_preout(self, name, root_input, shape):
-        """Scale down a `to_out`/`w2` input by `self.pre_out_proj_scale` (see `__init__`)."""
+        """Scale down a `to_out`/`w2` input by `self.pre_out_proj_scale` (see `__init__`).
+
+        Only needed to avoid float16 overflow (see ZIMAGE_DESIGN.md's "float16
+        Dynamic-Range Overflow" section); float32 I/O has enough headroom that the raw
+        pre-norm magnitude never overflows, so skip the extra node there.
+        """
+        if self.io_dtype != ir.DataType.FLOAT16:
+            return root_input
         return self._mul(name, [root_input, self._const(self.io_dtype, self.pre_out_proj_scale)], shape)
 
     def _make_attention(self, name, x, num_tokens_shape, cos, sin, attn):
