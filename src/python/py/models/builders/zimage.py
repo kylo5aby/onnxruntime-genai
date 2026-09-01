@@ -90,6 +90,17 @@ class ZImageTransformerModel(Model):
         self.t_mid_dim = 1024
         self.patch_dim = self.f_patch_size * self.patch_size * self.patch_size * self.in_channels
 
+        # `attention.to_out`/`feed_forward.w2`'s raw (pre-`SimplifiedLayerNormalization`)
+        # output can reach ~1e6 in magnitude on real inputs -- see ZIMAGE_DESIGN.md's
+        # "float16 Dynamic-Range Overflow" section. That overflows float16 (max ~65504)
+        # before the following RMSNorm ever gets a chance to renormalize it back down,
+        # producing Inf -> NaN. Since RMSNorm(x) is exactly scale-invariant to a positive
+        # scalar multiple of its input, rescaling *into* `to_out`/`w2` by a constant here
+        # is a no-op on the eventual normalized output (in exact math, and to well within
+        # float16 precision, since `norm_eps` is negligible next to these signals' variance
+        # either way) while keeping every intermediate representable in float16.
+        self.pre_out_proj_scale = 1.0 / 1024.0
+
     # ------------------------------------------------------------------
     # Weight loading
     # ------------------------------------------------------------------
@@ -465,6 +476,10 @@ class ZImageTransformerModel(Model):
     # ------------------------------------------------------------------
     # Attention / FeedForward / transformer block
     # ------------------------------------------------------------------
+    def _rescale_preout(self, name, root_input, shape):
+        """Scale down a `to_out`/`w2` input by `self.pre_out_proj_scale` (see `__init__`)."""
+        return self._mul(name, [root_input, self._const(self.io_dtype, self.pre_out_proj_scale)], shape)
+
     def _make_attention(self, name, x, num_tokens_shape, cos, sin, attn):
         shape3 = [1, num_tokens_shape, self.dim]
         q = self._linear(f"{name}/to_q", x, attn.to_q, shape3)
@@ -492,6 +507,7 @@ class ZImageTransformerModel(Model):
         # unsafe across this model's differently-sized sequences. Re-stamp with the real one.
         self.make_value(attn_out, self.io_dtype, shape=shape3)
 
+        attn_out = self._rescale_preout(f"{name}/to_out/PreScale", attn_out, shape3)
         return self._linear(f"{name}/to_out", attn_out, attn.to_out[0], shape3)
 
     def _make_feed_forward(self, name, x, num_tokens_shape, ff):
@@ -501,6 +517,7 @@ class ZImageTransformerModel(Model):
         gate = self._silu(f"{name}/w1_silu", gate, hidden_shape)
         up = self._linear(f"{name}/w3", x, ff.w3, hidden_shape)
         gated = self._mul(f"{name}/Gated", [gate, up], hidden_shape)
+        gated = self._rescale_preout(f"{name}/w2/PreScale", gated, hidden_shape)
         return self._linear(f"{name}/w2", gated, ff.w2, shape3)
 
     def _make_block(self, name, x, num_tokens_shape, cos, sin, block, modulation, adaln_input=None):

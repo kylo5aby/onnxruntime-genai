@@ -17,6 +17,7 @@ for build/usage instructions.
   - [Timestep Embedding and AdaLN Modulation](#timestep-embedding-and-adaln-modulation)
   - [Transformer Blocks](#transformer-blocks)
 - [Quantization](#quantization)
+- [float16 Dynamic-Range Overflow](#float16-dynamic-range-overflow)
 - [Implementation Gotcha: Symbolic Dim Aliasing](#implementation-gotcha-symbolic-dim-aliasing)
 - [Verification](#verification)
 
@@ -163,6 +164,60 @@ op-type-driven pass at save time — see `DESIGN.md`). `t_embedder`, `cap_embedd
 `adaLN_modulation` Linear are marked `exclude_from_quantization` (via `_linear`'s
 `exclude_from_quant=True`) since they're small, precision-sensitive layers — diffusers
 itself marks `t_embedder`/`cap_embedder` as `_skip_layerwise_casting_patterns`.
+
+## float16 Dynamic-Range Overflow
+
+`f16`/`f16_int4_quant` (float16 WebGPU I/O) originally produced NaN output. Root cause,
+found by bisecting node-by-node on a plain `CPUExecutionProvider` session (the bug
+reproduces without any WebGPU hardware) and cross-checking against a real
+`ZImageTransformer2DModel.forward` run in float32 PyTorch with the same inputs:
+
+- **Not a quantization bug.** The unquantized `f16` build hits the exact same NaN with the
+  same input; `f32_int4_quant` (int4 weights, float32 I/O) does not. So the failure tracks
+  `io_dtype`, not `-p int4`. Forcing `accuracy_level=1` (plain fp32 MatMulNBits compute
+  instead of the default int8-dynamic-activation-quantization `accuracy_level=4` path) does
+  not fix it either -- ruling out the MatMulNBits compute-kernel selection as the cause.
+- **The real cause: every modulated block's raw (pre-`SimplifiedLayerNormalization`)
+  `attention.to_out` and `feed_forward.w2` output genuinely exceeds float16's ~65504 max on
+  ordinary inputs.** With a standard-normal `hidden_states` latent (exactly what a real
+  diffusion sampler feeds in at its first denoising step) and the real checkpoint weights,
+  a 90-trial sweep (30 seeds x 3 timesteps, in float32 PyTorch, mirroring `zimage.py`
+  node-for-node) measured this raw pre-norm magnitude peaking anywhere from ~3.5e5 to
+  ~9.0e5 -- 5x-14x over float16's max, and *typically* (median trial) already ~6.6e5. This
+  is not a rare tail case; it is the common case for real inputs. `float32` never notices
+  because it has ~10^38 of headroom; `float16` overflows to `Inf` at exactly this point,
+  and the following RMSNorm turns `Inf` into `NaN` (`Inf / sqrt(mean(Inf^2))`), poisoning
+  everything downstream. Unmodulated blocks (`context_refiner`) never hit this: without
+  AdaLN's `1 + tanh(...)`-scaled `attention_norm1`/`ffn_norm1` output feeding in, their
+  pre-norm magnitude stays in the low hundreds.
+- **The fix does not require float32 precision anywhere** (which would give up most of
+  float16's throughput advantage on WebGPU). `SimplifiedLayerNormalization`
+  (`attention_norm2`/`ffn_norm2`) is exactly scale-invariant to a positive scalar multiple
+  of its input: `RMSNorm(c*x) == RMSNorm(x)` for any `c > 0`, since the weight
+  multiplication happens after the input is divided by its own RMS (`norm_eps` is
+  `1e-5` here, and scaling *down* only makes `eps`'s already-negligible contribution to
+  that division smaller still -- see the derivation below). Since `to_out`/`w2` are plain
+  linear projections, scaling their *input* down by a constant `c` scales their *output* by
+  exactly the same `c` (`(x/c) @ W == (x @ W)/c`) -- so rescaling right before those two
+  matmuls (`_rescale_preout`, used in `_make_attention`/`_make_feed_forward`) keeps every
+  intermediate tensor representable in float16 while leaving the eventual normalized output
+  bit-for-bit unaffected by the constant chosen (mathematically; float16 rounding aside).
+  `self.pre_out_proj_scale = 1/1024` was chosen with a large empirical margin over the
+  worst measured pre-scale peak (~9.0e5 / 1024 ~= 879, vs. float16's 65504 max -- about 75x
+  of headroom left for inputs outside the 90-trial sweep).
+
+  Derivation that `eps` stays negligible after rescaling: for
+  `y = x / sqrt(mean(x^2) + eps) * scale`, substituting `x' = x/c` gives
+  `y' = x / sqrt(mean(x^2) + eps*c^2) * scale` -- i.e. rescaling by `c < 1` *shrinks*
+  epsilon's effective contribution (by `c^2`), it does not grow it, so `y' == y` to within
+  float precision.
+- This is an empirically-derived safety margin, not a proven bound. The overflow is a
+  per-token phenomenon (`SimplifiedLayerNormalization`/attention operate per-token), so
+  resolution/caption-length shouldn't materially change the per-token peak measured here,
+  but this has only been validated at 32x32/64x64 resolutions -- if some real input is ever
+  found to still overflow past this margin, the next escape hatch is computing `to_out`/
+  `w2` (and the norm immediately after) in float32 regardless of `io_dtype`, at the cost of
+  losing float16 throughput for just those two matmuls per block.
 
 ## Implementation Gotcha: Symbolic Dim Aliasing
 
