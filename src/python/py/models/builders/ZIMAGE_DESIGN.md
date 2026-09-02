@@ -109,10 +109,10 @@ correct local path instead of trying to hit the HF Hub.
 
 `axes_dims`/`axes_lens`/`rope_theta` are static config values, so the 3 per-axis
 `(cos, sin)` frequency tables (`_make_rope_tables`) are precomputed once in Python with
-`torch` and stored as constant initializers — this mirrors the real-valued RoPE precompute
-used by optimum-intel's OpenVINO exporter for the same model (`repeat_interleave(2)` to
-turn `d/2` complex frequencies into `d` real cos/sin values, avoiding `torch.polar`/complex
-dtypes that ONNX can't represent).
+`torch` and stored as constant initializers. Each table is `[L, d/2, 2]` — one `(cos, sin)`
+value per rotated *pair*, avoiding `torch.polar`/complex dtypes that ONNX can't represent.
+(There is deliberately no `repeat_interleave(2)` to `d`-wide cos/sin: the fused
+`RotaryEmbedding` op below handles the pairing internally, so the caches stay half-width.)
 
 What *is* dynamic is the position-id lookup into those tables: caption tokens get
 `(pos=1..cap_len, 0, 0)` and image tokens get `(pos=cap_len+1 [constant], row=0..H_t-1,
@@ -120,10 +120,25 @@ col=0..W_t-1)`, matching `ZImageTransformer2DModel.create_coordinate_grid`. Sinc
 and the image token grid (`H_t = height/patch_size`, `W_t = width/patch_size`) are only
 known at runtime, `_build_position_grids` builds these ids with `Shape`/`Range`/`Expand`/
 `Reshape` ops rather than baking them in — this is what makes the dynamic-height/width
-requirement work with a single exported graph. `_apply_rope` then applies the interleaved-
-pair rotation (`x*cos + rotate_pairs(x)*sin`) using plain `Reshape`/`Gather`/`Mul`/`Concat`/
-`Add`, since the contrib `RotaryEmbedding`/`MRotaryEmbedding` ops assume single-axis integer
-positions gathered from a shared table, not this per-axis real-valued scheme.
+requirement work with a single exported graph. `_gather_axis_freqs`/`_build_freqs_cis` then
+gather the 3 axes and concat them into a per-token `[tokens, head_size/2, 2]` tensor, and
+`_cos_sin_caches_from_freqs_cis` splits that into the 2D `cos_cache`/`sin_cache`
+`[tokens, head_size/2]` operands.
+
+`_apply_rope` applies the rotation with a **single `com.microsoft.RotaryEmbedding` contrib
+op** (`interleaved=1`, `num_heads=n_heads`), not a hand-rolled decomposition. It reshapes
+the per-head Q/K `[1, tokens, heads, head_size]` down to the op's 3D `[1, tokens, dim]`
+layout, feeds the per-token caches plus identity `position_ids` (`Range(0, seq)` — the
+caches are already ordered per token, so each token indexes its own row), and returns the
+rotated `[1, tokens, dim]` that MHA consumes directly. This replaces the earlier 8-op
+`Reshape → Gather×2 → Neg → Concat → Reshape → Mul×2 → Add` pattern (68 of them — one per
+Q/K across the 34 attention blocks) with one fused kernel each. All the multi-axis,
+real-valued complexity stays in the cache-building above; by the time the op runs it sees a
+finished per-token cache, exactly what the fused kernel expects. `com.microsoft.RotaryEmbedding`
+is implemented in ORT-Web/JSEP, so it runs on the WebGPU deploy target (this is the same op
+the Olive `convert_z_image.py` reference fuses via `OrtTransformersOptimization`; here it is
+emitted directly, because that post-export pass only rewrites existing `RotaryEmbedding`
+*function* nodes, never a raw primitive decomposition).
 
 ### Patchify / Unpatchify
 
@@ -152,43 +167,51 @@ same pattern for the SwiGLU feed-forward (`w2(silu(w1(x)) * w3(x))`). `noise_ref
 layers) and `layers` (30 layers) use modulation; `context_refiner` (2 layers) does not,
 matching the reference model's `modulation=True/False` construction. `_make_attention`
 does Q/K/V projections, reshapes Q/K to `[1, tokens, heads, head_size]`, applies per-head
-RMSNorm (`qk_norm=true` in this model's config) and RoPE, reshapes back to
-`[1, tokens, dim]`, and calls the inherited `make_multi_head_attention` with no mask and no
-past/present KV inputs.
+RMSNorm (`qk_norm=true` in this model's config), then the fused `RotaryEmbedding` op (which
+returns the flattened `[1, tokens, dim]` directly), and calls the inherited
+`make_multi_head_attention` with no mask and no past/present KV inputs.
 
 ## Quantization
 
 Every `Linear` goes through the inherited `make_matmul`, so `-p int4`/`int8` apply
 automatically via the same mechanism every other model in this builder uses (a generic,
-op-type-driven pass at save time — see `DESIGN.md`). `t_embedder` and every
-`adaLN_modulation` Linear are marked `exclude_from_quantization` (via `_linear`'s
-`exclude_from_quant=True`) since they're small, precision-sensitive conditioning layers —
-diffusers itself marks `t_embedder`/`cap_embedder` as `_skip_layerwise_casting_patterns`,
-though `cap_embedder`'s own Linear is *not* currently marked `exclude_from_quant` here and
-so is quantized like any other weight (unlike `t_embedder`, which is).
+op-type-driven pass at save time — see `DESIGN.md`). The big sequence projections -- every
+attention `to_q`/`to_k`/`to_v`/`to_out` and every feed-forward `w1`/`w2`/`w3` across all
+34 blocks (238 `MatMul`s), plus the `final_linear` output projection -- are quantized to
+`MatMulNBits`, for **239** quantized nodes in `f16_int4_quant`.
 
-For `f16_int4_quant`, this leaves exactly 35 `MatMul` nodes unquantized (never converted to
-`MatMulNBits`): `t_embedder/mlp0` + `t_embedder/mlp2` (2), `adaLN_modulation/Linear` in
-every modulated block -- 2 `noise_refiner` + 30 `layers` (32) -- and `final_adaLN/Linear0`
-(1). Every other `Linear`, including `cap_embedder_linear`, becomes `MatMulNBits`.
+The small conditioning / embedding `Linear`s are deliberately **excluded** from int4
+quantization by passing `exclude_from_quantization=True` to `_linear` (which sets the flag
+`make_matmul` reads to add the node to `nodes_to_exclude`; the save-time `MatMulNBits` pass
+then leaves it as a float `MatMul` at `io_dtype`). Int4 rounding of these low-rank
+conditioning / input signals visibly corrupts the generated image ("garbled" output). The
+excluded set is 37 layers:
 
-`op_types_to_quantize=MatMul/Gather` (see `build_z_image_turbo.py`) also makes `Gather`
-nodes whose data operand is a constant weight initializer eligible for
-`GatherBlockQuantized`. The *only* `Gather`s in this graph with a constant initializer as
-their data input are the 3 precomputed RoPE frequency tables from `_make_rope_tables`
-(each gathered once for image positions, once for caption positions -- 6 `Gather` nodes
-total), so those are exactly what get converted; none were explicitly targeted for this,
-"Gather" quantization here is really an LLM-embedding-table convention that happens to also
-catch these tables. This is arguably unintended: the tables are real-valued cos/sin
-rotation values (not a large embedding matrix, so there's no meaningful size win), and
-`GatherBlockQuantized`'s int4 rounding directly degrades every RoPE-rotated Q/K value.
-Every other `Gather` in the graph (RoPE real/imag pair extraction, `height`/`width`/
-`cap_seq_len` shape extraction, cos/sin splitting from `freqs_cis` -- 143 nodes total) reads
-from a runtime-computed tensor, not a weight, so none of them were ever quantization
-candidates in the first place. If this turns out to visibly hurt accuracy, the fix is to
-mark the 3 RoPE tables `exclude_from_quant`-equivalent (add their `Gather` node names to
-`nodes_to_exclude`, or drop `Gather` from `op_types_to_quantize` and rely on `MatMul`
-quantization alone -- this model has no real embedding table to lose by doing so).
+- `x_embedder` (patch/input projection -- an input embedding, precision-sensitive like a
+  `Gather` embedding table),
+- `t_embedder/mlp0` + `mlp2` (timestep-embedding MLP, operates on a `[1, dim]` vector),
+- every `adaLN_modulation/Linear` (2 `noise_refiner` + 30 `layers` = 32; `context_refiner`
+  is unmodulated so has none) and `final_adaLN/Linear0`,
+- `cap_embedder_linear`.
+
+This matches the reference Olive export (`convert_z_image.py`), which quantizes exactly the
+same set (239 `MatMulNBits`) and leaves these 37 conditioning/embedding layers as float
+`Gemm`. (`final_linear` -- the reference's `/2-1/linear` -- **is** quantized in both; the
+reference simply patch-embeds outside its exported trunk, so it has no in-graph `x_embedder`
+to quantize, whereas this exporter includes and excludes it.)
+
+`op_types_to_quantize=MatMul` (see `build_z_image_turbo.py`) targets only `MatMul`; `Gather`
+is deliberately *not* quantized. The *only* `Gather`s in this graph with a constant
+initializer as their data input are the 3 precomputed RoPE frequency tables from
+`_make_rope_tables` (each gathered once for image positions, once for caption positions --
+6 `Gather` nodes total). Those are real-valued cos/sin rotation values, not an embedding
+matrix, so there's no meaningful size win from quantizing them, and `GatherBlockQuantized`'s
+int4 rounding would directly degrade every RoPE-rotated Q/K value -- so `Gather` is left out
+of `op_types_to_quantize`. Every other `Gather` in the graph (`height`/`width`/`cap_seq_len`
+shape extraction, and the `cos`/`sin` cache split from `freqs_cis`) reads from a
+runtime-computed tensor, not a weight, so none of them were ever quantization candidates in
+the first place. (The old hand-rolled RoPE decomposition added two more `Gather`s per Q/K
+for real/imag pair extraction; the fused `RotaryEmbedding` op removed all of those.)
 
 ## float16 Dynamic-Range Overflow
 
@@ -227,9 +250,14 @@ reproduces without any WebGPU hardware) and cross-checking against a real
   matmuls (`_rescale_preout`, used in `_make_attention`/`_make_feed_forward`) keeps every
   intermediate tensor representable in float16 while leaving the eventual normalized output
   bit-for-bit unaffected by the constant chosen (mathematically; float16 rounding aside).
-  `self.pre_out_proj_scale = 1/1024` was chosen with a large empirical margin over the
-  worst measured pre-scale peak (~9.0e5 / 1024 ~= 879, vs. float16's 65504 max -- about 75x
-  of headroom left for inputs outside the 90-trial sweep).
+  The constant is `c = 1/128`, matching the validated post-export `apply_scaledown_d_fix_all`
+  patch (all factors are exact powers of two in float16). `attention.to_out` takes the full
+  `1/128` on its single (MHA-output) input. `feed_forward.w2`'s input is the SwiGLU product
+  `SiLU(w1) * w3`, so the `1/128` is *split* across the two operands -- `1/8` on the SiLU
+  gate, `1/16` on `w3` (`8 * 16 == 128`) -- and applied *before* the elementwise multiply, so
+  neither the product itself nor the `w2` matmul that consumes it can overflow, not just the
+  matmul output. `1/128` leaves the worst measured pre-scale peak (~9.0e5 / 128 ~= 7000, vs.
+  float16's 65504 max) about 9x of headroom for inputs outside the 90-trial sweep.
 
   Derivation that `eps` stays negligible after rescaling: for
   `y = x / sqrt(mean(x^2) + eps) * scale`, substituting `x' = x/c` gives

@@ -99,7 +99,16 @@ class ZImageTransformerModel(Model):
         # is a no-op on the eventual normalized output (in exact math, and to well within
         # float16 precision, since `norm_eps` is negligible next to these signals' variance
         # either way) while keeping every intermediate representable in float16.
-        self.pre_out_proj_scale = 1.0 / 1024.0
+        #
+        # All factors are exact powers of two in float16. `attention.to_out` takes the full
+        # 1/128 on its single input. `feed_forward.w2`'s input is the SwiGLU product
+        # `SiLU(w1) * w3`, so the same 1/128 is *split* across the two factors -- 1/8 on the
+        # SiLU gate, 1/16 on w3 (8 * 16 == 128) -- and applied *before* the elementwise
+        # multiply, so neither the product nor the w2 matmul that consumes it can overflow.
+        # This mirrors the validated post-export `apply_scaledown_d_fix_all` strategy.
+        self.pre_out_proj_scale = 1.0 / 128.0
+        self.ff_gate_scale = 1.0 / 8.0
+        self.ff_up_scale = 1.0 / 16.0
 
     # ------------------------------------------------------------------
     # Weight loading
@@ -150,7 +159,7 @@ class ZImageTransformerModel(Model):
         """Return the name of an auto-created scalar/list constant (see `Model.make_constant`)."""
         return f"/model/constants/{self.to_str_dtype(dtype)}/{value}"
 
-    def _linear(self, name, root_input, linear, shape, seq_dim=None, exclude_from_quant=False):
+    def _linear(self, name, root_input, linear, shape, seq_dim=None, exclude_from_quantization=False):
         """Apply an `nn.Linear` (weight + optional bias) to `root_input`, returning the output name.
 
         `make_matmul`/`make_add_bias` always declare their output as the generic 3D
@@ -162,11 +171,19 @@ class ZImageTransformerModel(Model):
         (but differently-sized) intermediates as alias-compatible buffers -- causing a
         runtime shape-mismatch crash. So derive a name that's unique per logical sequence
         (or, for 2D tensors, per call site) unless the caller provides one explicitly.
+
+        `exclude_from_quantization=True` keeps this layer in full `io_dtype` precision even
+        under `-p int4`: it flags the weight so `make_matmul` adds this node to
+        `nodes_to_exclude`, and the save-time `MatMulNBits` pass leaves it as a float
+        `MatMul`. Reserved for the small conditioning / embedding Linears (timestep +
+        AdaLN modulation, caption / patch embedders, final AdaLN) where int4 rounding of
+        the low-rank conditioning signal visibly corrupts the image ("garbled" output).
+        The reference export leaves exactly these layers unquantized (as float `Gemm`).
         """
+        if exclude_from_quantization:
+            linear.exclude_from_quantization = True
         if seq_dim is None:
             seq_dim = shape[1] if len(shape) == 3 and isinstance(shape[1], str) else f"dim1_of_{name}"
-        if exclude_from_quant:
-            linear.exclude_from_quantization = True
         self.make_matmul(linear, name, root_input, seq_dim=seq_dim)
         output = f"{name}/output_0"
         # Re-stamp the declared shape: `make_matmul` assumes the generic 3D
@@ -229,18 +246,21 @@ class ZImageTransformerModel(Model):
         of length 1 (a dynamic dimension).
         """
         dtype = dtype or self.io_dtype
-        parts = []
-        for part in shape_parts:
-            if isinstance(part, int):
-                parts.append(self._const(ir.DataType.INT64, [part]))
-            else:
-                parts.append(part)
-        if len(parts) == 1:
-            shape_tensor = parts[0]
+        if all(isinstance(part, int) for part in shape_parts):
+            # Fully-static target shape: bake it as a single 1-D INT64 constant instead of
+            # Concat-ing one 1-element constant per dim at runtime. `_const` keys on value, so
+            # identical shapes (e.g. every block's `[1, -1, n_heads, head_size]`) share one
+            # initializer. Saves a Concat node per static reshape (~136 across the graph) and
+            # matches the reference export, which likewise carries static shapes as constants.
+            shape_tensor = self._const(ir.DataType.INT64, list(shape_parts))
         else:
-            shape_concat_name = f"{name}/ShapeConcat"
-            self.make_concat(shape_concat_name, parts, ir.DataType.INT64, shape=[len(parts)], axis=0)
-            shape_tensor = f"{shape_concat_name}/output_0"
+            parts = [self._const(ir.DataType.INT64, [part]) if isinstance(part, int) else part for part in shape_parts]
+            if len(parts) == 1:
+                shape_tensor = parts[0]
+            else:
+                shape_concat_name = f"{name}/ShapeConcat"
+                self.make_concat(shape_concat_name, parts, ir.DataType.INT64, shape=[len(parts)], axis=0)
+                shape_tensor = f"{shape_concat_name}/output_0"
         self.make_reshape(name, [root_input, shape_tensor], dtype, out_shape)
         return f"{name}/output_0"
 
@@ -277,23 +297,23 @@ class ZImageTransformerModel(Model):
     # RoPE: precomputed per-axis frequency tables + dynamic position ids
     # ------------------------------------------------------------------
     def _make_rope_tables(self):
-        """Precompute the 3 per-axis (cos, sin) tables as constant initializers.
+        """Precompute the 3 per-axis (cos, sin) frequency tables as constant initializers.
 
-        Mirrors `RopeEmbedder.precompute_freqs_cis` (real-valued form used by
-        the optimum-intel OpenVINO exporter): for axis `i` with dim `d` and
-        table length `L`, build `cos`/`sin` of shape `[L, d]` (each of the
-        `d/2` frequencies duplicated twice, i.e. `repeat_interleave(2)`) so
-        that the interleaved-pair rotation in `_apply_rope` can be computed
-        with plain real Mul/Add instead of complex numbers.
+        Mirrors `RopeEmbedder.precompute_freqs_cis`: for axis `i` with dim `d` and table
+        length `L`, build `cos`/`sin` of the `d/2` per-pair angles, stacked as `[L, d/2, 2]`.
+        These feed the `com.microsoft.RotaryEmbedding` contrib op, which consumes one cos/sin
+        value per rotated *pair* -- so the tables are `d/2` wide, not `d`. (The old hand-rolled
+        decomposition duplicated each frequency with `repeat_interleave(2)` to width `d`; the
+        fused kernel does that pairing internally, so it is dropped here.)
         """
         self.rope_table_names = []
         for i, (dim, length) in enumerate(zip(self.axes_dims, self.axes_lens)):
             freqs = 1.0 / (self.rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float64) / dim))
             positions = torch.arange(length, dtype=torch.float64)
             angles = torch.outer(positions, freqs).float()  # [length, dim//2]
-            cos_vals = torch.cos(angles).repeat_interleave(2, dim=1)  # [length, dim]
-            sin_vals = torch.sin(angles).repeat_interleave(2, dim=1)  # [length, dim]
-            table = torch.stack([cos_vals, sin_vals], dim=-1)  # [length, dim, 2]
+            cos_vals = torch.cos(angles)  # [length, dim//2]
+            sin_vals = torch.sin(angles)  # [length, dim//2]
+            table = torch.stack([cos_vals, sin_vals], dim=-1)  # [length, dim//2, 2]
             name = f"model.rope.axis_{i}_freqs"
             self.make_initializer(table, name, to=self.io_dtype)
             self.rope_table_names.append(name)
@@ -302,54 +322,73 @@ class ZImageTransformerModel(Model):
         dim = self.axes_dims[axis_idx]
         self.make_gather(
             name, [self.rope_table_names[axis_idx], position_ids], dtype=self.io_dtype,
-            shape=[num_tokens_shape, dim, 2], axis=0,
+            shape=[num_tokens_shape, dim // 2, 2], axis=0,
         )
         return f"{name}/output_0"
 
     def _build_freqs_cis(self, name, axis0_ids, axis1_ids, axis2_ids, num_tokens_shape):
-        """Gather + concat the 3 axes into a per-token `[num_tokens, head_size, 2]` (cos, sin) tensor."""
+        """Gather + concat the 3 axes into a per-token `[num_tokens, head_size//2, 2]` (cos, sin) tensor."""
         parts = [
             self._gather_axis_freqs(f"{name}/axis_{i}/Gather", i, ids, num_tokens_shape)
             for i, ids in enumerate((axis0_ids, axis1_ids, axis2_ids))
         ]
-        self.make_concat(name, parts, self.io_dtype, shape=[num_tokens_shape, self.head_size, 2], axis=1)
+        self.make_concat(name, parts, self.io_dtype, shape=[num_tokens_shape, self.head_size // 2, 2], axis=1)
         return f"{name}/output_0"
 
-    def _cos_sin_from_freqs_cis(self, name, freqs_cis, num_tokens_shape):
-        """Split `[tokens, head_size, 2]` into cos/sin `[1, tokens, 1, head_size]` (batch+head broadcast dims)."""
-        cos_raw = f"{name}/Cos"
-        sin_raw = f"{name}/Sin"
-        self.make_gather(cos_raw, [freqs_cis, self._const(ir.DataType.INT64, [0])], dtype=self.io_dtype, shape=[num_tokens_shape, self.head_size, 1], axis=2)
-        self.make_gather(sin_raw, [freqs_cis, self._const(ir.DataType.INT64, [1])], dtype=self.io_dtype, shape=[num_tokens_shape, self.head_size, 1], axis=2)
-        cos_sq = self._reshape(f"{cos_raw}/Squeeze", f"{cos_raw}/output_0", [1, -1, self.head_size], [1, num_tokens_shape, self.head_size])
-        sin_sq = self._reshape(f"{sin_raw}/Squeeze", f"{sin_raw}/output_0", [1, -1, self.head_size], [1, num_tokens_shape, self.head_size])
-        cos = self._unsqueeze(f"{name}/CosUnsqueeze", cos_sq, [2], [1, num_tokens_shape, 1, self.head_size])
-        sin = self._unsqueeze(f"{name}/SinUnsqueeze", sin_sq, [2], [1, num_tokens_shape, 1, self.head_size])
-        return cos, sin
+    def _cos_sin_caches_from_freqs_cis(self, name, freqs_cis, num_tokens_shape):
+        """Split `[tokens, head_size//2, 2]` into 2D cos/sin caches `[tokens, head_size//2]`.
 
-    def _apply_rope(self, name, x, num_tokens_shape, num_heads, cos, sin):
-        """Apply interleaved-pair RoPE to `x` of shape `[1, tokens, num_heads, head_size]`."""
+        These are the `cos_cache`/`sin_cache` inputs of `com.microsoft.RotaryEmbedding`
+        (one value per rotated pair, per token). A 0-D scalar Gather index drops the
+        trailing pair-of-(cos, sin) axis.
+        """
         half = self.head_size // 2
-        pairs_shape = [1, num_tokens_shape, num_heads, half, 2]
-        pairs = self._reshape(f"{name}/Pairs", x, [1, -1, num_heads, half, 2], pairs_shape)
+        cos_cache = f"{name}/Cos"
+        sin_cache = f"{name}/Sin"
+        self.make_gather(cos_cache, [freqs_cis, self._const(ir.DataType.INT64, 0)], dtype=self.io_dtype, shape=[num_tokens_shape, half], axis=2)
+        self.make_gather(sin_cache, [freqs_cis, self._const(ir.DataType.INT64, 1)], dtype=self.io_dtype, shape=[num_tokens_shape, half], axis=2)
+        return f"{cos_cache}/output_0", f"{sin_cache}/output_0"
 
-        real_name = f"{name}/Real"
-        imag_name = f"{name}/Imag"
-        self.make_gather(real_name, [pairs, self._const(ir.DataType.INT64, [0])], dtype=self.io_dtype, shape=[1, num_tokens_shape, num_heads, half, 1], axis=4)
-        self.make_gather(imag_name, [pairs, self._const(ir.DataType.INT64, [1])], dtype=self.io_dtype, shape=[1, num_tokens_shape, num_heads, half, 1], axis=4)
+    def _identity_position_ids(self, name, seq_len_scalar, out_dim_name):
+        """Build identity `position_ids` `[1, seq] = [[0, 1, ..., seq-1]]` (int64).
 
-        neg_imag = self._mul(f"{name}/NegImag", [f"{imag_name}/output_0", self._const(self.io_dtype, -1.0)], [1, num_tokens_shape, num_heads, half, 1])
-        rotated_pairs = f"{name}/RotatedPairs"
-        self.make_concat(rotated_pairs, [neg_imag, f"{real_name}/output_0"], self.io_dtype, shape=pairs_shape, axis=4)
-        rotated = self._reshape(
-            f"{name}/Rotated", f"{rotated_pairs}/output_0", [1, -1, num_heads, self.head_size],
-            [1, num_tokens_shape, num_heads, self.head_size],
+        The cos/sin caches produced above are already ordered per token, so
+        `RotaryEmbedding` must index them with the identity permutation to read each
+        token's own row. `seq_len_scalar` is a 0-D INT64 scalar (the `Range` end).
+        """
+        self.make_range(
+            name, [self._const(ir.DataType.INT64, 0), seq_len_scalar, self._const(ir.DataType.INT64, 1)],
+            ir.DataType.INT64, shape=[out_dim_name],
         )
+        return self._unsqueeze(f"{name}/Unsqueeze", f"{name}/output_0", [0], [1, out_dim_name], dtype=ir.DataType.INT64)
 
-        full_shape = [1, num_tokens_shape, num_heads, self.head_size]
-        term1 = self._mul(f"{name}/CosTerm", [x, cos], full_shape)
-        term2 = self._mul(f"{name}/SinTerm", [rotated, sin], full_shape)
-        return self._add(f"{name}/Out", [term1, term2], full_shape)
+    def _apply_rope(self, name, x, num_tokens_shape, num_heads, cos_cache, sin_cache, position_ids):
+        """Apply interleaved-pair RoPE via a single `com.microsoft.RotaryEmbedding` op.
+
+        Replaces the 8-op hand-rolled decomposition (Reshape -> Gather x2 -> Neg -> Concat
+        -> Reshape -> Mul x2 -> Add) with one fused kernel. Takes `x` shaped
+        `[1, tokens, num_heads, head_size]`, flattens it to the 3D `[1, tokens, hidden]`
+        layout the op requires (so `num_heads` must be passed), applies the rotation using
+        the per-token `cos`/`sin` caches (`head_size/2` wide) indexed by identity
+        `position_ids`, and returns the flattened `[1, tokens, hidden]` result that
+        `make_multi_head_attention` consumes directly. `interleaved=1` selects the GPT-J
+        pairing `(x[2i], x[2i+1])` this model uses.
+        """
+        hidden = num_heads * self.head_size
+        shape3 = [1, num_tokens_shape, hidden]
+        x3d = self._reshape(f"{name}/Reshape3D", x, [1, -1, hidden], shape3)
+        output = f"{name}/output_0"
+        self.make_node(
+            "RotaryEmbedding",
+            inputs=[x3d, position_ids, cos_cache, sin_cache],
+            outputs=[output],
+            name=name,
+            domain="com.microsoft",
+            interleaved=1,
+            num_heads=num_heads,
+        )
+        self.make_value(output, self.io_dtype, shape=shape3)
+        return output
 
     def _build_position_grids(self, height, width, cap_seq_len):
         """Build dynamic position-id tensors for the image and caption token grids.
@@ -442,11 +481,13 @@ class ZImageTransformerModel(Model):
         freq_embed = f"{freq_embed_name}/output_0"
 
         hidden = self._linear(
-            "/model/z_image/t_embedder/mlp0", freq_embed, weights.mlp[0], [1, self.t_mid_dim], exclude_from_quant=True
+            "/model/z_image/t_embedder/mlp0", freq_embed, weights.mlp[0], [1, self.t_mid_dim],
+            exclude_from_quantization=True,
         )
         hidden = self._silu("/model/z_image/t_embedder/mlp0_silu", hidden, [1, self.t_mid_dim])
         adaln_input = self._linear(
-            "/model/z_image/t_embedder/mlp2", hidden, weights.mlp[2], [1, self.adaln_embed_dim], exclude_from_quant=True
+            "/model/z_image/t_embedder/mlp2", hidden, weights.mlp[2], [1, self.adaln_embed_dim],
+            exclude_from_quantization=True,
         )
         return adaln_input
 
@@ -454,7 +495,9 @@ class ZImageTransformerModel(Model):
     # AdaLN modulation
     # ------------------------------------------------------------------
     def _make_adaln(self, name, adaln_input, linear, dim):
-        mod = self._linear(f"{name}/Linear", adaln_input, linear, [1, 4 * dim], exclude_from_quant=True)
+        # AdaLN modulation (only ever built for the modulated noise_refiner + layers
+        # blocks) is kept out of int4 quantization -- see `_linear`.
+        mod = self._linear(f"{name}/Linear", adaln_input, linear, [1, 4 * dim], exclude_from_quantization=True)
         split_sizes = self._const(ir.DataType.INT64, [dim, dim, dim, dim])
         outs = [f"{name}/Split/output_{i}" for i in range(4)]
         self.make_split(f"{name}/Split", [mod, split_sizes], outs, [self.io_dtype] * 4, [[1, dim]] * 4, axis=-1)
@@ -476,18 +519,22 @@ class ZImageTransformerModel(Model):
     # ------------------------------------------------------------------
     # Attention / FeedForward / transformer block
     # ------------------------------------------------------------------
-    def _rescale_preout(self, name, root_input, shape):
-        """Scale down a `to_out`/`w2` input by `self.pre_out_proj_scale` (see `__init__`).
+    def _rescale_preout(self, name, root_input, shape, scale=None):
+        """Scale down an output-projection input by `scale` (default `self.pre_out_proj_scale`).
 
         Only needed to avoid float16 overflow (see ZIMAGE_DESIGN.md's "float16
         Dynamic-Range Overflow" section); float32 I/O has enough headroom that the raw
-        pre-norm magnitude never overflows, so skip the extra node there.
+        pre-norm magnitude never overflows, so skip the extra node there. `_make_feed_forward`
+        passes the two split factors (1/8, 1/16) to scale the SwiGLU operands *before* their
+        multiply; `_make_attention` uses the default single 1/128 on the `to_out` input.
         """
         if self.io_dtype != ir.DataType.FLOAT16:
             return root_input
-        return self._mul(name, [root_input, self._const(self.io_dtype, self.pre_out_proj_scale)], shape)
+        if scale is None:
+            scale = self.pre_out_proj_scale
+        return self._mul(name, [root_input, self._const(self.io_dtype, scale)], shape)
 
-    def _make_attention(self, name, x, num_tokens_shape, cos, sin, attn):
+    def _make_attention(self, name, x, num_tokens_shape, cos_cache, sin_cache, position_ids, attn):
         shape3 = [1, num_tokens_shape, self.dim]
         q = self._linear(f"{name}/to_q", x, attn.to_q, shape3)
         k = self._linear(f"{name}/to_k", x, attn.to_k, shape3)
@@ -501,11 +548,11 @@ class ZImageTransformerModel(Model):
             q_heads = self._rms_norm(f"{name}/NormQ", q_heads, attn.norm_q.weight, heads_shape)
             k_heads = self._rms_norm(f"{name}/NormK", k_heads, attn.norm_k.weight, heads_shape)
 
-        q_heads = self._apply_rope(f"{name}/RopeQ", q_heads, num_tokens_shape, self.n_heads, cos, sin)
-        k_heads = self._apply_rope(f"{name}/RopeK", k_heads, num_tokens_shape, self.n_heads, cos, sin)
-
-        q_flat = self._reshape(f"{name}/QFlat", q_heads, [1, -1, self.dim], shape3)
-        k_flat = self._reshape(f"{name}/KFlat", k_heads, [1, -1, self.dim], shape3)
+        # Fused RoPE: each `_apply_rope` emits one `com.microsoft.RotaryEmbedding` op and
+        # returns the flattened `[1, tokens, dim]` result MHA consumes directly (so no
+        # separate QFlat/KFlat reshape is needed).
+        q_flat = self._apply_rope(f"{name}/RopeQ", q_heads, num_tokens_shape, self.n_heads, cos_cache, sin_cache, position_ids)
+        k_flat = self._apply_rope(f"{name}/RopeK", k_heads, num_tokens_shape, self.n_heads, cos_cache, sin_cache, position_ids)
 
         self.make_multi_head_attention(f"{name}/MHA", q_path=q_flat, k_path=k_flat, v_path=v)
         attn_out = f"{name}/MHA/output_0"
@@ -523,11 +570,16 @@ class ZImageTransformerModel(Model):
         gate = self._linear(f"{name}/w1", x, ff.w1, hidden_shape)
         gate = self._silu(f"{name}/w1_silu", gate, hidden_shape)
         up = self._linear(f"{name}/w3", x, ff.w3, hidden_shape)
+        # float16 overflow protection: split the 1/128 pre-`w2` scale across the two SwiGLU
+        # factors (1/8 on the SiLU gate, 1/16 on w3) and apply it *before* the elementwise
+        # multiply, so neither the product nor the w2 matmul that consumes it can overflow.
+        # `ffn_norm2` (RMSNorm) downstream absorbs the 1/128. No-op for float32 I/O.
+        gate = self._rescale_preout(f"{name}/w1_silu/PreScale", gate, hidden_shape, self.ff_gate_scale)
+        up = self._rescale_preout(f"{name}/w3/PreScale", up, hidden_shape, self.ff_up_scale)
         gated = self._mul(f"{name}/Gated", [gate, up], hidden_shape)
-        gated = self._rescale_preout(f"{name}/w2/PreScale", gated, hidden_shape)
         return self._linear(f"{name}/w2", gated, ff.w2, shape3)
 
-    def _make_block(self, name, x, num_tokens_shape, cos, sin, block, modulation, adaln_input=None):
+    def _make_block(self, name, x, num_tokens_shape, cos_cache, sin_cache, position_ids, block, modulation, adaln_input=None):
         shape3 = [1, num_tokens_shape, self.dim]
         if modulation:
             scale_msa, gate_msa, scale_mlp, gate_mlp = self._make_adaln(
@@ -537,7 +589,7 @@ class ZImageTransformerModel(Model):
         normed1 = self._rms_norm(f"{name}/attention_norm1", x, block.attention_norm1.weight, shape3)
         if modulation:
             normed1 = self._mul(f"{name}/AttnScale", [normed1, scale_msa], shape3)
-        attn_out = self._make_attention(f"{name}/attention", normed1, num_tokens_shape, cos, sin, block.attention)
+        attn_out = self._make_attention(f"{name}/attention", normed1, num_tokens_shape, cos_cache, sin_cache, position_ids, block.attention)
         attn_out = self._rms_norm(f"{name}/attention_norm2", attn_out, block.attention_norm2.weight, shape3)
         if modulation:
             attn_out = self._mul(f"{name}/GateMsaMul", [attn_out, gate_msa], shape3)
@@ -557,29 +609,47 @@ class ZImageTransformerModel(Model):
     # LayerNorm without affine params (`FinalLayer.norm_final`)
     # ------------------------------------------------------------------
     def _layer_norm_no_affine(self, name, root_input, shape, eps=1e-6):
-        reduced_shape = shape[:-1] + [1]
-        axes = self._const(ir.DataType.INT64, [-1])
+        """Standard (mean-subtracting) LayerNorm without affine params (`FinalLayer.norm_final`).
 
-        mean_name = f"{name}/Mean"
-        self.make_reduce_mean(mean_name, [root_input, axes], self.io_dtype, reduced_shape, keepdims=True)
-        diff_name = f"{name}/Diff"
-        self.make_sub(diff_name, [root_input, f"{mean_name}/output_0"], self.io_dtype, shape)
-        sq_name = f"{name}/Sq"
-        self.make_mul(sq_name, [f"{diff_name}/output_0", f"{diff_name}/output_0"], self.io_dtype, shape)
-        var_name = f"{name}/Var"
-        self.make_reduce_mean(var_name, [f"{sq_name}/output_0", axes], self.io_dtype, reduced_shape, keepdims=True)
-        var_eps = self._add_scalar(f"{name}/VarEps", f"{var_name}/output_0", eps, reduced_shape)
-        std_name = f"{name}/Std"
-        self.make_sqrt(std_name, [var_eps], self.io_dtype, reduced_shape)
-        self.make_div(name, [f"{diff_name}/output_0", f"{std_name}/output_0"], self.io_dtype, shape)
-        return f"{name}/output_0"
+        Emitted as the fused `LayerNormalization` op with `stash_type=1`, so ONNX Runtime
+        computes the mean/variance -- including the `(x-mean)^2` accumulation -- in float32
+        internally regardless of `io_dtype`. That range is required: the pre-norm hidden
+        state's squared deviation reaches ~2e6 on real inputs (see ZIMAGE_DESIGN.md's
+        "float16 Dynamic-Range Overflow"), which overflows float16 (max ~65504) to `Inf` and
+        collapses the output to a garbled image on a true-float16 backend (WebGPU/WebNN). The
+        bug is masked on the CPU EP (which upcasts float16 math to float32) and absent in the
+        `-p f32*` builds, so it only surfaces on-device. Fusing matches the reference export
+        (whose `norm_final` is the identical fused op) and every other norm in this graph
+        (`SimplifiedLayerNormalization`, also `stash_type=1`); the earlier hand-decomposed
+        form computed `(x-mean)^2` in `io_dtype`, which is exactly what overflowed.
+
+        `norm_final` has no learnable affine, so `scale` is all-ones and `bias` all-zeros --
+        both materialized (as the reference does) since ONNX `LayerNormalization` requires the
+        scale input; the AdaLN scale/shift is applied separately by the caller.
+        """
+        dim = shape[-1]
+        base = name[1:].replace("/", ".")
+        scale_name, bias_name = f"{base}.scale_ones", f"{base}.bias_zeros"
+        self.make_initializer(torch.ones(dim), scale_name, to=self.io_dtype)
+        self.make_initializer(torch.zeros(dim), bias_name, to=self.io_dtype)
+        output = f"{name}/output_0"
+        self.make_node(
+            "LayerNormalization",
+            inputs=[root_input, scale_name, bias_name],
+            outputs=[output],
+            name=name,
+            axis=-1,
+            epsilon=eps,
+            stash_type=1,
+        )
+        self.make_value(output, self.io_dtype, shape=shape)
+        return output
 
     # ------------------------------------------------------------------
     # Sequence concatenation / slicing
     # ------------------------------------------------------------------
-    def _concat_seq(self, name, parts, feat_dim, out_dim_name, is_4d=False):
-        out_shape = [1, out_dim_name, 1, feat_dim] if is_4d else [1, out_dim_name, feat_dim]
-        self.make_concat(name, parts, self.io_dtype, shape=out_shape, axis=1)
+    def _concat_seq(self, name, parts, feat_dim, out_dim_name):
+        self.make_concat(name, parts, self.io_dtype, shape=[1, out_dim_name, feat_dim], axis=1)
         return f"{name}/output_0"
 
     def _slice_seq(self, name, root_input, count_dim1_tensor, feat_dim, out_dim_name):
@@ -611,8 +681,15 @@ class ZImageTransformerModel(Model):
 
         img_freqs = self._build_freqs_cis("/model/z_image/img_freqs", *grids["img_axis"], "img_seq_len")
         cap_freqs = self._build_freqs_cis("/model/z_image/cap_freqs", *grids["cap_axis"], "cap_seq_len")
-        img_cos, img_sin = self._cos_sin_from_freqs_cis("/model/z_image/img_cs", img_freqs, "img_seq_len")
-        cap_cos, cap_sin = self._cos_sin_from_freqs_cis("/model/z_image/cap_cs", cap_freqs, "cap_seq_len")
+        img_cos, img_sin = self._cos_sin_caches_from_freqs_cis("/model/z_image/img_cs", img_freqs, "img_seq_len")
+        cap_cos, cap_sin = self._cos_sin_caches_from_freqs_cis("/model/z_image/cap_cs", cap_freqs, "cap_seq_len")
+
+        # Identity position ids for the fused `com.microsoft.RotaryEmbedding` op (the cos/sin
+        # caches above are already ordered per token, so each token indexes its own cache row).
+        img_len_scalar = self._scalar("/model/z_image/img_len_scalar", num_img_tokens)
+        cap_len_scalar = self._scalar("/model/z_image/cap_pos_len_scalar", cap_seq_len)
+        img_pos = self._identity_position_ids("/model/z_image/img_pos", img_len_scalar, "img_seq_len")
+        cap_pos = self._identity_position_ids("/model/z_image/cap_pos", cap_len_scalar, "cap_seq_len")
 
         # --- patchify image: [1, C, H, W] -> [1, H_t*W_t, patch_dim] ---
         img_squeezed = self._reshape(
@@ -638,7 +715,8 @@ class ZImageTransformerModel(Model):
 
         x_embedder = self.weights.all_x_embedder[self.patch_key]
         img_tokens = self._linear(
-            "/model/z_image/x_embedder", img_patches_b, x_embedder, [1, "img_seq_len", self.dim]
+            "/model/z_image/x_embedder", img_patches_b, x_embedder, [1, "img_seq_len", self.dim],
+            exclude_from_quantization=True,
         )
 
         # --- caption embed ---
@@ -647,7 +725,8 @@ class ZImageTransformerModel(Model):
             [1, "cap_seq_len", self.cap_feat_dim],
         )
         cap_tokens = self._linear(
-            "/model/z_image/cap_embedder_linear", cap_norm, self.weights.cap_embedder[1], [1, "cap_seq_len", self.dim]
+            "/model/z_image/cap_embedder_linear", cap_norm, self.weights.cap_embedder[1], [1, "cap_seq_len", self.dim],
+            exclude_from_quantization=True,
         )
 
         # --- timestep / AdaLN input ---
@@ -657,7 +736,7 @@ class ZImageTransformerModel(Model):
         x = img_tokens
         for i in range(self.n_refiner_layers):
             x = self._make_block(
-                f"/model/noise_refiner.{i}", x, "img_seq_len", img_cos, img_sin,
+                f"/model/noise_refiner.{i}", x, "img_seq_len", img_cos, img_sin, img_pos,
                 self.weights.noise_refiner[i], modulation=True, adaln_input=adaln_input,
             )
         img_tokens = x
@@ -666,21 +745,28 @@ class ZImageTransformerModel(Model):
         x = cap_tokens
         for i in range(self.n_refiner_layers):
             x = self._make_block(
-                f"/model/context_refiner.{i}", x, "cap_seq_len", cap_cos, cap_sin,
+                f"/model/context_refiner.{i}", x, "cap_seq_len", cap_cos, cap_sin, cap_pos,
                 self.weights.context_refiner[i], modulation=False,
             )
         cap_tokens = x
 
         # --- unify: image tokens first, caption tokens second ---
         unified = self._concat_seq("/model/z_image/unify_tokens", [img_tokens, cap_tokens], self.dim, "unified_seq_len")
-        unified_cos = self._concat_seq("/model/z_image/unify_cos", [img_cos, cap_cos], self.head_size, "unified_seq_len", is_4d=True)
-        unified_sin = self._concat_seq("/model/z_image/unify_sin", [img_sin, cap_sin], self.head_size, "unified_seq_len", is_4d=True)
+        # The cos/sin caches are 2D `[tokens, head_size//2]`; concatenate along the token
+        # axis (0) so unified cache row t belongs to unified token t (image tokens first).
+        half = self.head_size // 2
+        self.make_concat("/model/z_image/unify_cos", [img_cos, cap_cos], self.io_dtype, shape=["unified_seq_len", half], axis=0)
+        self.make_concat("/model/z_image/unify_sin", [img_sin, cap_sin], self.io_dtype, shape=["unified_seq_len", half], axis=0)
+        unified_cos = "/model/z_image/unify_cos/output_0"
+        unified_sin = "/model/z_image/unify_sin/output_0"
+        unified_len_scalar = self._int_scalar_add("/model/z_image/unified_len_scalar", img_len_scalar, cap_len_scalar)
+        unified_pos = self._identity_position_ids("/model/z_image/unified_pos", unified_len_scalar, "unified_seq_len")
 
         # --- main layers (unified sequence) ---
         x = unified
         for i in range(self.n_layers):
             x = self._make_block(
-                f"/model/layers.{i}", x, "unified_seq_len", unified_cos, unified_sin,
+                f"/model/layers.{i}", x, "unified_seq_len", unified_cos, unified_sin, unified_pos,
                 self.weights.layers[i], modulation=True, adaln_input=adaln_input,
             )
 
@@ -689,7 +775,7 @@ class ZImageTransformerModel(Model):
         final_silu = self._silu("/model/z_image/final_adaLN/silu", adaln_input, [1, self.adaln_embed_dim])
         final_scale_raw = self._linear(
             "/model/z_image/final_adaLN/Linear0", final_silu, final_layer.adaLN_modulation[1], [1, self.dim],
-            exclude_from_quant=True,
+            exclude_from_quantization=True,
         )
         final_scale = self._add_scalar("/model/z_image/final_adaLN/Plus1", final_scale_raw, 1.0, [1, self.dim])
         final_scale = self._unsqueeze("/model/z_image/final_adaLN/Unsqueeze", final_scale, [1], [1, 1, self.dim])
@@ -720,10 +806,16 @@ class ZImageTransformerModel(Model):
             "/model/z_image/unpatchify/Merge", f"{img_perm_out}/output_0",
             [self.in_channels, height, width], [self.in_channels, "height", "width"],
         )
-        sample = self._unsqueeze("/model/z_image/unpatchify/Batch", img_merged, [0], [1, self.in_channels, "height", "width"])
-
-        # Alias to the declared graph output name.
-        self.make_node("Identity", inputs=[sample], outputs=["sample"], name="/model/z_image/output_identity")
+        # Final unpatchify step (add the batch dim) writes straight to the declared graph
+        # output `sample`, so no trailing Identity/alias node is needed. `make_value` is
+        # idempotent, so re-declaring `sample` here just stamps dtype/shape on the existing
+        # graph-output value.
+        batch_axis = self._const(ir.DataType.INT64, [0])
+        self.make_node(
+            "Unsqueeze", inputs=[img_merged, batch_axis], outputs=["sample"],
+            name="/model/z_image/unpatchify/Batch",
+        )
+        self.make_value("sample", self.io_dtype, shape=[1, self.in_channels, "height", "width"])
 
         del self.weights
 

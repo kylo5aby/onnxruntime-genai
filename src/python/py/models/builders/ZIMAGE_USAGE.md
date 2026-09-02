@@ -61,7 +61,7 @@ Example matching this repo's existing `build_model.py` wrapper convention (WebGP
 
 ```bash
 python builder.py -e webgpu -p int4 \
-  --extra_options int4_block_size=32 int4_accuracy_level=4 int4_op_types_to_quantize=MatMul/Gather \
+  --extra_options int4_block_size=32 int4_accuracy_level=4 int4_op_types_to_quantize=MatMul \
   -i path_to_local_folder/transformer \
   -o Z-Image-Turbo-transformer-genai-wgpu-int4 \
   -c tmp
