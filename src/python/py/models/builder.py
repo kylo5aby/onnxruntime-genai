@@ -53,6 +53,7 @@ from builders import (
     VideoChatFlashQwenModel,
     WhisperModel,
     ZImageTransformerModel,
+    ZImageVAEDecoderModel,
 )
 from builders.qwen import Qwen35Model, Qwen35MoEModel
 from quantization import KV_CACHE_QUANT_SCHEMES, QuantConfig
@@ -167,6 +168,7 @@ def check_extra_options(
         "hf_remote",
         "disable_qkv_fusion",
         "fuse_qk_norm_gqa",
+        "fuse_group_norm",
         "prune_lm_head",
         "use_paged_attention",
         "windowed_kv_cache",
@@ -496,6 +498,8 @@ def create_model(
     # List architecture options in alphabetical order
     if getattr(config, "_class_name", None) == "ZImageTransformer2DModel":
         onnx_model = ZImageTransformerModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
+    elif getattr(config, "_class_name", None) == "AutoencoderKL":
+        onnx_model = ZImageVAEDecoderModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
     elif config.architectures[0] == "ChatGLMForConditionalGeneration" or config.architectures[0] == "ChatGLMModel":
         # Quantized ChatGLM model has ChatGLMForConditionalGeneration as architecture whereas HF model as the latter
         config.bos_token_id = 1
@@ -858,6 +862,9 @@ def get_args():
                     If true, the model will not fuse the Q, K, and V projections. Automatically assumed for certain EPs.
                 fuse_qk_norm_gqa = Enable QK Norm GQA fusion for CUDA and WebGPU. Default is true.
                     Set to false to keep explicit Q/K normalization nodes instead of passing Q/K norm weights into GroupQueryAttention.
+                fuse_group_norm = Emit fused com.microsoft GroupNorm/SkipGroupNorm contrib ops in the Z-Image VAE decoder. Default is false.
+                    When false, every GroupNorm is decomposed into standard ONNX ops (Reshape -> InstanceNormalization -> Reshape -> Mul -> Add,
+                    plus Sigmoid -> Mul for the fused SiLU) so the model runs on EPs without GroupNorm/SkipGroupNorm kernels.
                 use_webgpu_fp32 = Use FP32 I/O precision for WebGPU EP.
                     Use this option to enable GPUs that do not support FP16 on WebGPU (e.g. GTX 10xx).
                 use_cuda_bf16 = Use BF16 I/O precision in quantized ONNX models for CUDA EP.

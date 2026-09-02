@@ -46,6 +46,7 @@ from .qwen import (
 from .smollm import SmolLM3Model
 from .whisper import WhisperModel
 from .zimage import ZImageTransformerModel
+from .zimage_vae import ZImageVAEDecoderModel
 
 __all__ = [
     "ChatGLMModel",
