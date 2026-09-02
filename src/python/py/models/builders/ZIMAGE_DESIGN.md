@@ -25,10 +25,11 @@ for build/usage instructions.
 
 This is intentionally a narrow slice of the full Z-Image-Turbo pipeline:
 
-- **Transformer trunk only.** No Qwen3 text encoder, no VAE decoder. The exported graph
-  consumes pre-computed caption embeddings and a raw image latent, and produces a
-  denoised/velocity-predicted latent. A caller drives the diffusion sampling loop
-  (scheduler, text encoding, VAE decode) itself.
+- **Transformer trunk only (this document).** No VAE decoder. The Qwen3 text encoder is built
+  separately — stock `builder.py` LLM path plus `builders/zimage_text_encoder.py`
+  post-processing — not by this exporter. The exported transformer graph consumes pre-computed
+  caption embeddings and a raw image latent, and produces a denoised/velocity-predicted latent.
+  A caller drives the diffusion sampling loop (scheduler, text encoding, VAE decode) itself.
 - **Standalone ONNX graph.** No changes to onnxruntime-genai's C++ generator runtime; the
   graph is meant to be run directly via a plain `onnxruntime.InferenceSession`.
 - **Dynamic height/width.** A single exported graph works for any resolution (512x512,

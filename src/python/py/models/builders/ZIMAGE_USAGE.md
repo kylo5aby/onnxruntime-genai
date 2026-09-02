@@ -1,7 +1,9 @@
 # How to Run: Z-Image-Turbo Transformer Trunk Exporter
 
-This exports the transformer trunk of Z-Image-Turbo only (no text encoder, no VAE) as a
-standalone ONNX graph with dynamic height/width and batch size 1. See
+This walkthrough covers the transformer trunk exporter — a standalone ONNX graph with dynamic
+height/width and batch size 1 (no VAE). The Qwen3 text encoder that produces the caption
+embeddings this graph consumes is built separately (`build_z_image_turbo.py -m text_encoder`;
+see the repo [README](../../../../../README.md#building-the-text-encoder)). See
 [ZIMAGE_DESIGN.md](ZIMAGE_DESIGN.md) for the architecture and scope this implies.
 
 ## Contents
@@ -116,8 +118,10 @@ sample = sess.run(
 
 Drive your own diffusion sampling loop (e.g. `FlowMatchEulerDiscreteScheduler`, matching
 Z-Image-Turbo's `scheduler/scheduler_config.json`) around this call, feeding it the
-caption embedding from a Qwen3 text encoder and decoding the final latent with the model's
-VAE — both out of scope for this exporter.
+caption embedding from a Qwen3 text encoder (build one with
+`build_z_image_turbo.py -m text_encoder` — see the repo
+[README](../../../../../README.md#building-the-text-encoder)) and decoding the final latent
+with the model's VAE (out of scope here).
 
 ## Verifying Numerical Correctness
 

@@ -360,6 +360,7 @@ class ZImagePipeline:
         verbose: bool = False,
         all_images: bool = False,
         dev_transformer_path: str = "",
+        dev_text_encoder_path: str = "",
     ):
         print("ZImagePipeline")
         self.path_ = path
@@ -378,11 +379,20 @@ class ZImagePipeline:
         #   - has no internal padding/attention-mask logic, so `encoder_hidden_states`
         #     must be pre-padded to a multiple of 32 tokens by the caller (done in
         #     `run_text_encoder`/`run_transformer` below).
-        # Text encoder and VAE decoder are left untouched (still the WebNN ones).
+        # Only the VAE decoder is always left untouched (still the WebNN one).
         self.using_dev_transformer_ = bool(dev_transformer_path)
         if self.using_dev_transformer_:
             self.transformer_model_ = os.path.abspath(dev_transformer_path)
             print(f"Using dev z-transformer: {self.transformer_model_}")
+
+        # --text_encoder: swap in the onnxruntime-genai-built Qwen3 text encoder
+        # (build_z_image_turbo.py -m text_encoder) instead of the bundled WebNN one. It's a
+        # drop-in: same `input_ids`/`attention_mask` inputs and a single `encoder_hidden_state`
+        # output (float16, auto-detected in initialize_text_encoder / used for model_dtype_).
+        self.using_dev_text_encoder_ = bool(dev_text_encoder_path)
+        if self.using_dev_text_encoder_:
+            self.text_encoder_model_ = os.path.abspath(dev_text_encoder_path)
+            print(f"Using dev text encoder: {self.text_encoder_model_}")
 
         #  Get supported providers
         available_providers = ort.get_available_providers()
@@ -409,6 +419,7 @@ class ZImagePipeline:
             raise ValueError(f"Invalid ep: {ep}.")
 
         self.model_dtype_ = None
+        self.vae_dtype_ = None
 
         self.scheduler_ = Scheduler(verbose=verbose)
 
@@ -763,6 +774,18 @@ class ZImagePipeline:
             for output in outputs:
                 print(f"output: {output}")
 
+            # The VAE's `latent_sample` input dtype is independent of `model_dtype_` (which
+            # tracks the text encoder's output dtype). The bundle's text encoder emits float32
+            # and its VAE takes float32, so they coincided; but a self-built `-m text_encoder`
+            # emits float16, which would then be fed into the float32 VAE input. Query the VAE's
+            # own input dtype instead of assuming it matches the text encoder.
+            latent_input = next(i for i in inputs if i.name == "latent_sample")
+            if latent_input.type == "tensor(float16)":
+                self.vae_dtype_ = np.float16
+            else:
+                self.vae_dtype_ = np.float32
+            print(f"VAE decoder dtype: {self.vae_dtype_}")
+
             return True
         except Exception as e:
             print(f"Error initializing VAE Decoder: {e}")
@@ -778,7 +801,7 @@ class ZImagePipeline:
         if self.verbose_:
             log_tensor_stats(scaled_latents_input, "scaled_latents_input")
 
-        ort_inputs = {"latent_sample": scaled_latents_input.astype(self.model_dtype_)}
+        ort_inputs = {"latent_sample": scaled_latents_input.astype(self.vae_dtype_)}
 
         try:
             outputs = self.vae_decoder_sess_.run(None, ort_inputs)
@@ -878,8 +901,20 @@ if __name__ == "__main__":
         metavar="PATH",
         help=(
             "Path to an onnxruntime-genai-exported z-transformer model.onnx "
-            "(see onnxruntime-genai's build_z_image_turbo.py) to use instead of the "
-            "bundled WebNN transformer. Text encoder and VAE decoder are unchanged."
+            "(build_z_image_turbo.py -m transformer) to use instead of the bundled WebNN "
+            "transformer. VAE decoder is unchanged; see --text_encoder for the text encoder."
+        ),
+    )
+    parser.add_argument(
+        "--text_encoder",
+        type=str,
+        default="",
+        metavar="PATH",
+        help=(
+            "Path to an onnxruntime-genai-built Qwen3 text encoder "
+            "(build_z_image_turbo.py -m text_encoder, e.g. .../text_encoder_model_q4f16.onnx) "
+            "to use instead of the bundled WebNN text encoder. It's a drop-in for the bundle's "
+            "onnx/text_encoder_model_q4f16.onnx."
         ),
     )
     args = parser.parse_args()
@@ -895,6 +930,7 @@ if __name__ == "__main__":
     print(f"verbose: {args.verbose}")
     print(f"all_images: {args.all_images}")
     print(f"transformer: {args.transformer}")
+    print(f"text_encoder: {args.text_encoder}")
 
     if not os.path.exists(args.model):
         print(f"\n❌ ERROR: Model path not found!")
@@ -906,10 +942,16 @@ if __name__ == "__main__":
         print(f"       The path '{args.transformer}' does not exist.")
         sys.exit(1)
 
+    if args.text_encoder and not os.path.exists(args.text_encoder):
+        print(f"\n❌ ERROR: --text_encoder model path not found!")
+        print(f"       The path '{args.text_encoder}' does not exist.")
+        sys.exit(1)
+
     pipeline = ZImagePipeline(
         args.model, args.ep, args.num_inference_steps,
         args.height, args.width, args.verbose, args.all_images,
         dev_transformer_path=args.transformer,
+        dev_text_encoder_path=args.text_encoder,
     )
     pipeline.initialize()
 
