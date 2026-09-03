@@ -360,6 +360,7 @@ class ZImagePipeline:
         verbose: bool = False,
         all_images: bool = False,
         dev_transformer_path: str = "",
+        dev_text_encoder_path: str = "",
         dev_vae_decoder_path: str = "",
     ):
         print("ZImagePipeline")
@@ -379,11 +380,21 @@ class ZImagePipeline:
         #   - has no internal padding/attention-mask logic, so `encoder_hidden_states`
         #     must be pre-padded to a multiple of 32 tokens by the caller (done in
         #     `run_text_encoder`/`run_transformer` below).
-        # Text encoder is left untouched (still the WebNN one).
+        # Each of the three models can be swapped independently; see --text_encoder and
+        # --vae_decoder below.
         self.using_dev_transformer_ = bool(dev_transformer_path)
         if self.using_dev_transformer_:
             self.transformer_model_ = os.path.abspath(dev_transformer_path)
             print(f"Using dev z-transformer: {self.transformer_model_}")
+
+        # --text_encoder: swap in the onnxruntime-genai-built Qwen3 text encoder
+        # (build_z_image_turbo.py -m text_encoder) instead of the bundled WebNN one. It's a
+        # drop-in: same `input_ids`/`attention_mask` inputs and a single `encoder_hidden_state`
+        # output (float16, auto-detected in initialize_text_encoder / used for model_dtype_).
+        self.using_dev_text_encoder_ = bool(dev_text_encoder_path)
+        if self.using_dev_text_encoder_:
+            self.text_encoder_model_ = os.path.abspath(dev_text_encoder_path)
+            print(f"Using dev text encoder: {self.text_encoder_model_}")
 
         # --vae_decoder: swap in the onnxruntime-genai-exported VAE decoder (see
         # builders/zimage_vae.py). Same I/O names/shapes as the bundled WebNN one; its I/O
@@ -773,10 +784,12 @@ class ZImagePipeline:
             for output in outputs:
                 print(f"output: {output}")
 
-            # The VAE decoder's I/O dtype follows its own build precision (the genai-built
-            # `-p fp16` decoder is float16 I/O; the reference HF export is float32), so read it
-            # from the model instead of assuming the text encoder's dtype.
-            if inputs[0].type == "tensor(float16)":
+            # The VAE's `latent_sample` input dtype is independent of `model_dtype_` (which
+            # tracks the text encoder's output dtype): the bundled WebNN VAE is float32 I/O,
+            # the genai-built `-p fp16` VAE is float16 I/O, and a self-built `-m text_encoder`
+            # emits float16. Query the VAE's own input dtype instead of assuming it matches.
+            latent_input = next(i for i in inputs if i.name == "latent_sample")
+            if latent_input.type == "tensor(float16)":
                 self.vae_dtype_ = np.float16
             else:
                 self.vae_dtype_ = np.float32
@@ -897,8 +910,20 @@ if __name__ == "__main__":
         metavar="PATH",
         help=(
             "Path to an onnxruntime-genai-exported z-transformer model.onnx "
-            "(see onnxruntime-genai's build_z_image_turbo.py) to use instead of the "
-            "bundled WebNN transformer. Text encoder and VAE decoder are unchanged."
+            "(build_z_image_turbo.py -m transformer) to use instead of the bundled WebNN "
+            "transformer. See --text_encoder and --vae_decoder for the other two models."
+        ),
+    )
+    parser.add_argument(
+        "--text_encoder",
+        type=str,
+        default="",
+        metavar="PATH",
+        help=(
+            "Path to an onnxruntime-genai-built Qwen3 text encoder "
+            "(build_z_image_turbo.py -m text_encoder, e.g. .../text_encoder_model_q4f16.onnx) "
+            "to use instead of the bundled WebNN text encoder. It's a drop-in for the bundle's "
+            "onnx/text_encoder_model_q4f16.onnx."
         ),
     )
     parser.add_argument(
@@ -925,6 +950,7 @@ if __name__ == "__main__":
     print(f"verbose: {args.verbose}")
     print(f"all_images: {args.all_images}")
     print(f"transformer: {args.transformer}")
+    print(f"text_encoder: {args.text_encoder}")
     print(f"vae_decoder: {args.vae_decoder}")
 
     if not os.path.exists(args.model):
@@ -937,6 +963,11 @@ if __name__ == "__main__":
         print(f"       The path '{args.transformer}' does not exist.")
         sys.exit(1)
 
+    if args.text_encoder and not os.path.exists(args.text_encoder):
+        print(f"\n❌ ERROR: --text_encoder model path not found!")
+        print(f"       The path '{args.text_encoder}' does not exist.")
+        sys.exit(1)
+
     if args.vae_decoder and not os.path.exists(args.vae_decoder):
         print(f"\n❌ ERROR: --vae_decoder model path not found!")
         print(f"       The path '{args.vae_decoder}' does not exist.")
@@ -946,6 +977,7 @@ if __name__ == "__main__":
         args.model, args.ep, args.num_inference_steps,
         args.height, args.width, args.verbose, args.all_images,
         dev_transformer_path=args.transformer,
+        dev_text_encoder_path=args.text_encoder,
         dev_vae_decoder_path=args.vae_decoder,
     )
     pipeline.initialize()
